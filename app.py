@@ -1,5 +1,6 @@
 """Run: streamlit run app.py"""
 from datetime import date, timedelta, datetime, timezone
+import time
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -11,8 +12,14 @@ st.caption('历史日线 · 收益与风险 · 可下载数据')
 
 @st.cache_data(ttl=900)
 def load_prices(ticker, start, end):
-    frame = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True)
-    return frame, datetime.now(timezone.utc).isoformat(timespec='seconds')
+    # Cache failures too, so widget changes do not repeatedly hit the provider.
+    try:
+        frame = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=True, raise_errors=True)
+        if frame.empty or 'Close' not in frame:
+            return None, None, '没有取得行情，请检查代码和日期。'
+        return frame, datetime.now(timezone.utc).isoformat(timespec='seconds'), None
+    except Exception:
+        return None, None, '行情服务暂时不可用或请求受限，请稍后重试。'
 
 with st.sidebar:
     st.header('跟踪设置')
@@ -20,17 +27,44 @@ with st.sidebar:
     start = st.date_input('开始日期', date.today() - timedelta(days=365))
     end = st.date_input('结束日期（包含当天）', date.today())
     rate = st.number_input('假设年化无风险利率（%）', min_value=0.0, max_value=50.0, value=0.0, step=0.25)
-    refresh = st.button('刷新数据')
+    uploaded = st.file_uploader('备用：上传该股票的调整日线 CSV', type=['csv'])
+    st.caption('CSV 第一列为日期，价格列使用 Adj Close 或 Close；Close 应为调整价格。')
+    refresh = st.button('刷新行情（至少间隔 60 秒）')
 if refresh:
-    load_prices.clear()
+    now = time.monotonic()
+    if now - st.session_state.get('last_refresh', float('-inf')) >= 60:
+        load_prices.clear(ticker, start.isoformat(), (end + timedelta(days=1)).isoformat())
+        st.session_state['last_refresh'] = now
+    else:
+        st.warning('请等待 60 秒后再刷新，频繁刷新可能延长限流。')
 if not ticker or start >= end:
     st.info('请输入股票代码，并让开始日期早于结束日期。')
     st.stop()
+source = 'Yahoo Finance（通过 yfinance）'
 try:
-    frame, retrieved = load_prices(ticker, start.isoformat(), (end + timedelta(days=1)).isoformat())
-    if frame.empty or 'Close' not in frame:
-        st.warning('没有取得价格数据，请检查代码、日期或稍后重试。')
-        st.stop()
+    key = (ticker, start.isoformat(), end.isoformat())
+    if uploaded is not None:
+        frame = pd.read_csv(uploaded, index_col=0)
+        frame.index = pd.to_datetime(frame.index, errors='raise', utc=True)
+        frame = frame.loc[(frame.index.date >= start) & (frame.index.date <= end)]
+        if 'Adj Close' in frame:
+            frame['Close'] = frame['Adj Close']
+        if 'Close' not in frame:
+            raise ValueError('CSV 缺少 Adj Close 或 Close 列。')
+        source = '用户上传 CSV（请确认属于当前股票且为调整价格）'
+        retrieved = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    else:
+        frame, retrieved, error = load_prices(ticker, start.isoformat(), (end + timedelta(days=1)).isoformat())
+        if error:
+            st.warning(error)
+            previous = st.session_state.get('last_success', {}).get(key)
+            if previous is None:
+                st.info('当前没有可用缓存。可在侧栏上传此前导出的真实价格 CSV 继续分析，或稍后刷新行情。')
+                st.stop()
+            frame, retrieved = previous
+            st.info('正在展示本会话此前成功获取的缓存数据，时间见下方。')
+        else:
+            st.session_state.setdefault('last_success', {})[key] = (frame.copy(), retrieved)
     frame = frame.sort_index()
     frame = frame.loc[~frame.index.duplicated(keep='last')]
     close = pd.to_numeric(frame['Close'], errors='coerce').dropna()
@@ -40,8 +74,8 @@ except Exception as exc:
     st.stop()
 
 st.subheader(f'{ticker} · 最近可用日线')
-st.write(f'最后数据日期：{close.index[-1].date()} ｜ 抓取时间（UTC）：{retrieved}')
-st.caption('来源：Yahoo Finance（通过 yfinance）。价格使用股息及拆股调整口径，不是实时行情；当天日线可能尚未完成。')
+st.write(f'最后数据日期：{close.index[-1].date()} ｜ 获取/导入时间（UTC）：{retrieved}')
+st.caption(f'来源：{source}。使用调整价格口径，不是实时行情；当天日线可能尚未完成。')
 cols = st.columns(5)
 cols[0].metric('最新调整收盘价（USD）', f'{close.iloc[-1]:,.2f}')
 cols[1].metric('区间收益率', f'{metrics["total_return"]:.2%}')
