@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 from src.metrics import calculate_metrics
+from src.research import normalize_news, build_report
 
 st.set_page_config(page_title='NVDA 股票跟踪', layout='wide')
 st.title('NVDA 股票跟踪助手')
@@ -21,6 +22,10 @@ def load_prices(ticker, start, end):
     except Exception:
         return None, None, '行情服务暂时不可用或请求受限，请稍后重试。'
 
+@st.cache_data(ttl=900)
+def load_news(ticker):
+    return normalize_news(yf.Ticker(ticker).news), datetime.now(timezone.utc).isoformat(timespec='seconds')
+
 with st.sidebar:
     st.header('跟踪设置')
     ticker = st.text_input('股票代码', 'NVDA').strip().upper()
@@ -33,6 +38,7 @@ with st.sidebar:
 if refresh:
     now = time.monotonic()
     if now - st.session_state.get('last_refresh', float('-inf')) >= 60:
+        load_news.clear(ticker)
         load_prices.clear(ticker, start.isoformat(), (end + timedelta(days=1)).isoformat())
         st.session_state['last_refresh'] = now
     else:
@@ -94,3 +100,24 @@ st.download_button('下载本次历史数据 CSV', output.to_csv().encode('utf-8
 with st.expander('指标怎么算？'):
     st.markdown('收益率 = 末日调整价格 / 首日调整价格 − 1。\n\n年化波动率 = 日简单收益率样本标准差 × √252。\n\nSharpe = 日均超额收益 × 252 / 年化波动率；年化无风险利率按复利换算为日利率。\n\n最大回撤 = 调整价格相对区间内此前最高价的最大跌幅。所有指标仅覆盖选定日期，未扣交易成本。')
 st.caption('本版本展示历史数据和计算结果，不包含 AI 新闻分析或买卖建议。')
+
+st.subheader('新闻与研究简报')
+st.caption('新闻为当前返回的线索，不按上方行情日期筛选；标题不代表已核验事实。点击链接阅读原文。')
+news = []
+try:
+    news, news_retrieved = load_news(ticker)
+    news_status = f'抓取时间（UTC）：{news_retrieved}；返回 {len(news)} 条有效链接'
+    st.caption(news_status)
+    if news:
+        st.dataframe(pd.DataFrame(news).rename(columns={'title': '标题', 'url': '原文', 'publisher': '来源', 'published': '发布时间'}),
+                     column_config={'原文': st.column_config.LinkColumn('原文', display_text='阅读原文')}, hide_index=True, use_container_width=True)
+    else:
+        st.info('当前未取得有效新闻链接，仍可下载行情简报。')
+except Exception:
+    news_status = '新闻抓取失败；本简报没有新闻数据'
+    st.warning('新闻暂时无法获取，行情和简报导出仍可使用。')
+report = build_report(ticker, close, metrics, rate / 100, retrieved, news, news_status, source)
+with st.expander('预览研究简报（程序模板）'):
+    st.text(report)
+st.download_button('下载研究简报 Markdown', report.encode('utf-8-sig'), f'{ticker}_research_{end}.md', 'text/markdown')
+
